@@ -1,48 +1,86 @@
-# Repository Guidelines
+# 项目协作指南
 
-## 项目结构与模块组织
+## 项目定位与范围
 
-本项目是 EVE Online 通用工具箱，处于起步阶段，当前重点为 Rust 后端。技术栈为 Tauri 2、React、TypeScript，计划使用 Tailwind，但尚未配置。
+EVE Alert（`eve-alert`）是面向 EVE Online 的屏幕 RGB 识别与告警桌面应用。当前范围为多角色画面捕获、区域与颜色配置、告警和提醒状态识别，以及本地和远程通知。技术栈为 Tauri 2、Rust、React、TypeScript，界面使用 MUI（Material Design）、Emotion 与少量 CSS，支持浅色、深色和跟随系统主题；未配置 Tailwind。
 
-- `src-tauri/src/main.rs` 为程序入口，`lib.rs` 初始化 Tauri。
-- `src-tauri/src/platform/` 放置平台能力；`screencast/` 包含捕获数据模型与 PipeWire 实现目录，`window/` 为窗口能力预留模块。
-- `src-tauri/src/plugin/` 包含基于 `DashMap` 的服务注册表。
-- `src/` 为前端源码，目前保留 Vite 示例；`src/assets/`、`public/` 为前端资源，`src-tauri/icons/` 为应用图标。
-- `src-tauri/tauri.conf.json` 管理应用配置，`capabilities/` 管理权限；`flake.nix` 描述开发环境。
+开发应围绕现有监控流程开展。新增功能需说明与 RGB 识别或告警的关系；未经用户明确要求，不扩展为通用 EVE 工具箱，也不因现有插件基础设施而主动增加产品功能。按任务需要修改，避免无关清理或架构重写。
 
-## 构建、测试与开发命令
+## 项目结构与职责
 
-以下命令供开发者在已配置的环境中按需执行：
+- `src/App.tsx`、`src/App.css`：角色与来源配置、监控控制、页面布局及事件展示。
+- `src/theme.ts`：MUI 主题、浅色与深色配色及组件默认样式。
+- `src/SnapshotEditor.tsx`、`src/selection.ts`：截图缩放、框选、移动与缩放选区、原始像素取色和坐标计算。
+- `src/NotificationSettings.tsx`：通知渠道配置表单。
+- `src/reporting.ts`：前端业务类型与 Tauri IPC 封装；修改命令或序列化结构时同步检查此处。
+- `src-tauri/src/main.rs`：程序入口；`lib.rs`：Tauri 初始化、状态管理与命令注册。
+- `src-tauri/src/reporting/config.rs`：配置模型、校验、RGB 匹配、告警与提醒状态机、配置路径。
+- `src-tauri/src/reporting/mod.rs`：业务命令、捕获编排、监控生命周期、事件分发、截图与音频读取。
+- `src-tauri/src/reporting/capture.rs`：来源选择和恢复凭据存储；`outputs.rs`：SSE、WebSocket、桌面通知、ntfy 与 OneBot 输出。
+- `src-tauri/src/platform/screencast/`：共享捕获接口和数据模型；`pipewire/`：Linux Portal / PipeWire 实现。
+- `src-tauri/src/plugin/`：内置插件、服务契约与生命周期管理，具体约定见该目录的 `README.md`；当前业务由 Tauri 直接管理，勿假定已接入插件生命周期。
+- `src-tauri/tauri.conf.json`、`capabilities/`：应用配置与权限；`flake.nix`：开发环境；`public/`、`src/assets/`、`src-tauri/icons/`：静态资源与图标。
+
+业务规则留在 `reporting/`，平台细节放入对应平台子模块，共享捕获契约留在 `screencast/` 上层。避免将识别逻辑或平台细节直接放入 Tauri 启动代码。
+
+## 必须保持的业务行为
+
+除非用户明确要求改变，下列行为应保持，并在修改相关逻辑时验证：
+
+- 区域两端坐标均包含；任意像素的 RGB 精确匹配任意目标颜色即命中，忽略 alpha。不要默默引入容差或改变坐标语义。
+- 各角色独立维护状态。告警首次命中产生 `Warn`，持续命中不重复；由命中转为未命中时产生 `WarnCleared`，启动时未命中不发送解除。
+- 捕获异常和区域越界不视为告警解除。越界时暂停该角色识别并重置提醒状态。
+- 提醒按“准备区域命中 → 敌人区域命中 → 敌人区域不再命中”产生一次 `Reminder` 后重置。
+- 当前捕获帧率上限为 2 FPS。更改频率、匹配规则或状态迁移时，说明对漏检、重复告警和资源消耗的影响。
+- 停止监控应关闭输出任务并释放捕获资源；保留恢复凭据。捕获失败、取消、重复启停等路径也需正确清理。
+- 事件类型 `Warn`、`WarnCleared`、`Reminder` 和 JSON 字段属于外部接入协议；变更时检查所有输出渠道、前端类型、测试和 README，说明兼容性影响。
+
+## 配置与数据
+
+Debug 配置为编译时项目根目录的 `reporting.json`；Release 为 `$HOME/.local/share/eve-alert/reporting.json`，当前不使用 XDG 配置目录覆盖。恢复凭据为同目录的 `reporting-capture.json`，导出截图位于 `screenshots/`。
+
+配置和恢复凭据通过同目录临时文件替换；保留现有校验、Unix 文件权限与凭据轮换语义。凭据按角色名称关联，不要把 Portal node ID 当作可持久化授权。不要在日志、示例、截图或提交中暴露访问令牌和捕获凭据。
+
+产品名为 `eve-alert`，显示名称为 `EVE Alert`，Tauri 标识符为 `dev.ecamika.project.eve-alert`。应用标识符和数据路径的变动需要考虑已有配置与授权，不能假定系统或应用会自动迁移。
+
+## 构建与验证命令
+
+以下命令在已配置的项目开发环境中按需执行：
 
 | 命令 | 用途 |
 | --- | --- |
-| `pnpm dev` | 启动前端开发服务器，端口为 4567。 |
-| `pnpm exec tauri dev` | 启动桌面应用及前端开发流程。 |
-| `pnpm build` | 执行 TypeScript 检查并构建前端。 |
-| `pnpm exec tauri build` | 构建并打包桌面应用。 |
-| `pnpm lint` | 使用 Oxlint 检查前端。 |
-| `cargo check --manifest-path src-tauri/Cargo.toml` | 检查 Rust 编译。 |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | 运行 Rust 测试。 |
-| `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 检查 Rust 格式。 |
-| `cargo clippy --manifest-path src-tauri/Cargo.toml` | 检查 Rust 常见问题。 |
+| `pnpm dev` | 启动前端开发服务器，端口为 4567；桌面能力仍需 Tauri IPC |
+| `pnpm exec tauri dev` | 启动桌面应用及前端开发流程 |
+| `pnpm build` | TypeScript 检查与前端构建 |
+| `pnpm exec tauri build` | 构建并打包桌面应用 |
+| `pnpm lint` | 使用 Oxlint 检查前端 |
+| `pnpm test` | 使用 Node 内置测试框架检查截图选区坐标与边界 |
+| `cargo check --manifest-path src-tauri/Cargo.toml` | 检查 Rust 编译 |
+| `cargo test --manifest-path src-tauri/Cargo.toml` | 运行 Rust 测试，可追加模块过滤条件 |
+| `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 检查 Rust 格式 |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml` | 检查 Rust 常见问题 |
 
-打包前核对 `frontendDist` 与 Vite 实际输出目录；当前配置为 `../../dist/`。
+Vite 输出目录为项目根目录 `dist/`，Tauri 的 `frontendDist` 为 `../dist/`（相对 `src-tauri/`）。涉及构建配置时核对两者一致。
 
-## 代码风格与命名约定
+## 代码风格与测试
 
-遵循 `.editorconfig`：UTF-8、两空格缩进。Rust 格式遵循 `src-tauri/.rustfmt.toml`；模块、函数使用 `snake_case`，类型与 trait 使用 `PascalCase`。React 组件使用 `PascalCase`，变量与函数使用 `camelCase`。前端由 Oxlint 检查，TypeScript 已启用未使用变量检查。
+遵循 `.editorconfig`：UTF-8、两空格缩进；Rust 格式遵循 `src-tauri/.rustfmt.toml`。Rust 模块与函数使用 `snake_case`，类型与 trait 使用 `PascalCase`；React 组件使用 `PascalCase`，变量与函数使用 `camelCase`。前端由 Oxlint 检查，TypeScript 已启用未使用变量检查。
 
-平台实现放入对应子模块；共享数据类型与接口留在上层模块。避免将平台细节直接耦合到 Tauri 启动逻辑。
+现有 Rust 测试分布在 `reporting/`、`platform/screencast/` 和 `plugin/` 等模块，前端选区纯逻辑测试位于 `tests/`，使用开发环境提供的 Node 内置测试框架；无组件测试框架或覆盖率门槛。测试聚焦关键业务行为、边界条件、错误处理和缺陷回归，禁止添加过多无用测试；避免重复覆盖、照搬实现，或仅验证简单赋值与字段读写。不为凑数量或覆盖率增加测试。
 
-## 测试规范
+新增后端测试沿用 Rust 内置测试框架与现有模块组织；集成测试可放入 `src-tauri/tests/`。名称描述行为，例如 `returns_none_for_unknown_service`。按改动风险选择检查；纯文档修改无需运行完整构建或桌面捕获。
 
-当前没有已编写的测试、前端测试框架或覆盖率门槛。新增后端逻辑使用 Rust 内置测试框架，在模块内添加 `#[cfg(test)] mod tests`；集成测试放入 `src-tauri/tests/`。测试名称应描述行为，例如 `returns_none_for_unknown_service`。涉及屏幕捕获的改动应说明运行平台、授权过程及实际验证结果。
+涉及识别逻辑时关注边界、多角色隔离、告警去重与解除、提醒迁移和无效帧。涉及捕获时关注授权恢复、取消或失败清理、尺寸变化和资源释放。涉及输出时检查事件协议、断线和失败行为，避免引入重复推送。
+
+屏幕捕获改动的报告应注明操作系统、桌面会话、授权过程和实际验证结果。声音、桌面通知、ntfy、WebSocket 与 OneBot 需相应环境联调；明确区分自动测试通过与真实桌面验证，未执行的验证应如实说明。
 
 ## 提交与 Pull Request
 
-当前目录无法读取 Git 历史，因此没有可确认的既有提交规范。建议使用 `feat:`、`fix:`、`docs:`、`refactor:` 前缀，例如 `feat: 添加捕获来源模型`。
+建议使用 `feat:`、`fix:`、`docs:`、`refactor:` 前缀，例如 `fix: 避免捕获异常触发告警解除`。
 
-PR 应说明目的、影响模块、验证命令与结果，并关联相关 issue。界面改动附截图；平台功能注明操作系统与桌面会话。保留已有未提交修改，不提交 `node_modules/`、`target/`、`.direnv/` 等生成内容。
+PR 说明目的、影响模块、用户可观察到的行为、验证命令与结果，并关联相关 issue。界面改动附截图；平台功能注明操作系统与桌面会话；配置或协议变更说明兼容性和迁移方式。行为变化时同步更新 README，协作规则或结构变化时同步更新本文件。
+
+保留已有未提交修改，不提交 `node_modules/`、`target/`、`.direnv/`、`dist/` 等生成内容，也不提交运行配置、捕获凭据或截图数据。
 
 ## 智能体与环境约束
 

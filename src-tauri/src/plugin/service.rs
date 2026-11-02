@@ -1,59 +1,93 @@
-use dashmap::DashMap;
-use std::{any::Any, sync::Arc};
+//! 服务按插件成批发布和撤销；读取只克隆句柄，不持锁调用服务。
+
+use std::{
+  any::Any,
+  collections::HashMap,
+  sync::{Arc, RwLock},
+};
+
+use super::PluginId;
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub struct ServiceId(pub String);
 
-pub type Service = Box<dyn Any + Send + Sync>;
+pub type Service = Arc<dyn Any + Send + Sync>;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+  #[error("服务未就绪：{0:?}")]
+  Unavailable(ServiceId),
+  #[error("服务类型不匹配：{0:?}")]
+  TypeMismatch(ServiceId),
+  #[error("服务已存在：{0:?}")]
+  Duplicate(ServiceId),
+  #[error("插件未声明此服务：{0:?}")]
+  Undeclared(ServiceId),
+  #[error("当前插件阶段不允许此操作")]
+  InvalidPhase,
+}
+
+struct ServiceEntry {
+  owner: PluginId,
+  value: Service,
+}
+
+#[derive(Default)]
 pub struct ServiceRegistry {
-  services: DashMap<ServiceId, Service>,
+  services: RwLock<HashMap<ServiceId, ServiceEntry>>,
 }
 
 impl ServiceRegistry {
-  pub fn register<T: Any + Send + Sync>(&self, service_id: ServiceId, service: T) {
-    let arc_service = Arc::new(service);
-    self.services.insert(service_id, Box::new(arc_service));
+  /// 注册和获取必须使用完全相同的 T，例如 Box<dyn Screencast>。
+  /// 已取出的 Arc 不会被撤销；服务实现需要自行处理停止后的调用。
+  pub fn get_service<T: Any + Send + Sync>(&self, id: &ServiceId) -> Result<Arc<T>, ServiceError> {
+    let services = self.services.read().unwrap();
+    let value = &services
+      .get(id)
+      .ok_or_else(|| ServiceError::Unavailable(id.clone()))?
+      .value;
+    Arc::clone(value)
+      .downcast::<T>()
+      .map_err(|_| ServiceError::TypeMismatch(id.clone()))
   }
 
-  pub fn get_service<T: Any + Send + Sync>(&self, service_id: &ServiceId) -> Option<Arc<T>> {
-    let any = self.services.get(service_id)?;
-    let downcasted = any.downcast_ref::<Arc<T>>()?;
-    let arc_service = Arc::clone(downcasted);
-    Some(arc_service)
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use dashmap::DashMap;
-
-  #[test]
-  fn dyn_type_check() {
-    trait TestTrait: Send + Sync {
-      fn test_function(&self) -> bool {
-        true
+  pub(crate) fn publish(
+    &self,
+    owner: &PluginId,
+    pending: &mut HashMap<ServiceId, Service>,
+  ) -> Result<(), ServiceError> {
+    let mut services = self.services.write().unwrap();
+    for id in pending.keys() {
+      if services.contains_key(id) {
+        return Err(ServiceError::Duplicate(id.clone()));
       }
     }
+    for (id, value) in pending.drain() {
+      services.insert(
+        id,
+        ServiceEntry {
+          owner: owner.clone(),
+          value,
+        },
+      );
+    }
+    Ok(())
+  }
 
-    struct TestStruct {}
-
-    impl TestTrait for TestStruct {}
-
-    let service_registry = super::ServiceRegistry {
-      services: DashMap::new(),
+  pub(crate) fn revoke(&self, owner: &PluginId) {
+    // 用户服务的 Drop 在锁外运行。
+    let removed = {
+      let mut services = self.services.write().unwrap();
+      let ids: Vec<_> = services
+        .iter()
+        .filter(|(_, entry)| &entry.owner == owner)
+        .map(|(id, _)| id.clone())
+        .collect();
+      ids
+        .into_iter()
+        .filter_map(|id| services.remove(&id))
+        .collect::<Vec<_>>()
     };
-
-    let test_struct = TestStruct {};
-
-    let service_id = super::ServiceId("private:dyn_type_check".to_string());
-
-    service_registry.register::<Box<dyn TestTrait> /* register 的泛型声明是必须的，且必须声明为 dyn 类型，否则会导致 downcast 无法匹配 TypeId */ >(service_id.clone(), Box::new(test_struct));
-
-    let service = service_registry
-      .get_service::<Box<dyn TestTrait>>(&service_id)
-      .unwrap();
-
-    assert!(service.test_function())
+    drop(removed);
   }
 }

@@ -45,7 +45,7 @@ struct Prepared {
 
 fn token() -> String {
   format!(
-    "toolbox_{}_{}",
+    "eve_alert_{}_{}",
     std::process::id(),
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
   )
@@ -654,7 +654,7 @@ async fn run(
   // 原生回调开始前建立每个来源的独立邮箱，保留尚未取出流时的首帧及错误。
   control.register_sources(&sources);
   let thread = std::thread::Builder::new()
-    .name("toolbox-pipewire".into())
+    .name("eve-alert-pipewire".into())
     .spawn(move || runtime::run(fd, streams, options, worker_control, native_ready))
     .map_err(|error| caused_by("无法创建 PipeWire 线程", error))?;
   let mut joined = tokio::task::spawn_blocking(move || {

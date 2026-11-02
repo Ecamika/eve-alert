@@ -1,10 +1,23 @@
-pub mod eve;
 pub mod platform;
 pub mod plugin;
+mod reporting;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .manage(reporting::Reporting::default())
+    .invoke_handler(tauri::generate_handler![
+      reporting::reporting_load,
+      reporting::reporting_save,
+      reporting::reporting_select,
+      reporting::reporting_snapshot,
+      reporting::reporting_export,
+      reporting::reporting_release,
+      reporting::reporting_start,
+      reporting::reporting_stop,
+      reporting::reporting_status,
+      reporting::reporting_audio,
+    ])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(

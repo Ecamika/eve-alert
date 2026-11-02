@@ -7,9 +7,14 @@
     "dev": "vite --port 4567",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "node --test --test-isolation=none tests/*.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.5.0",
+    "@mui/material": "^9.5.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

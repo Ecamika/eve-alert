@@ -1,10 +1,10 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "eve-toolbox",
+  "productName": "eve-alert",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "dev.ecamika.project.eve-alert",
   "build": {
-    "frontendDist": "../../dist/",
+    "frontendDist": "../dist/",
     "devUrl": "http://localhost:4567",
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build"
@@ -12,11 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "EVE Toolbox",
+        "title": "EVE Alert",
+        "width": 1280,
+        "height": 900,
         "resizable": true,
         "fullscreen": false
       }
     ],
+    "withGlobalTauri": true,
     "security": {
       "csp": null
     }

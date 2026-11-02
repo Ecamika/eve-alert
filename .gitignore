@@ -1,3 +1,9 @@
 node_modules/
 target/
 .direnv/
+dist/
+/reporting.json
+/reporting.json.tmp
+/reporting-capture.json
+/reporting-capture.json.tmp
+/screenshots/

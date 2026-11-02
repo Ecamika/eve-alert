@@ -406,7 +406,7 @@ pub(super) fn run(
     if let Some(serial) = target.serial {
       props.insert(*pw::keys::TARGET_OBJECT, serial.to_string());
     }
-    let stream = pw::stream::StreamBox::new(&core, "toolbox-screencast", props)
+    let stream = pw::stream::StreamBox::new(&core, "eve-alert-screencast", props)
       .map_err(|error| caused_by("无法创建 PipeWire stream", error))?;
     let started = Rc::new(Cell::new(false));
     let started_state = started.clone();
@@ -748,8 +748,8 @@ mod tests {
     let props = properties! {
       "media.title" => "",
       "node.description" => "  ",
-      "node.name" => "toolbox-screencast",
-      "application.name" => "Toolbox",
+      "node.name" => "eve-alert-screencast",
+      "application.name" => "EVE Alert",
     };
     let mut metadata = SourceMetadata {
       source: source("test"),
