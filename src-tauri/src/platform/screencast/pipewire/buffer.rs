@@ -4,8 +4,8 @@ use pipewire::{
   spa::{
     self,
     buffer::{
-      meta::{MetaHeader, MetaHeaderFlags, MetaVideoCrop, MetaVideoTransform},
       DataType,
+      meta::{MetaHeader, MetaHeaderFlags, MetaVideoCrop, MetaVideoTransform},
     },
     param::video::{VideoFormat, VideoInfoRaw},
   },
@@ -59,10 +59,16 @@ pub(super) fn validate_format(format: VideoInfoRaw) -> Result<(), CaptureError> 
   Ok(())
 }
 
-pub(super) fn copy_frame(
+#[derive(Clone, Copy)]
+pub(super) struct PreparedFrame {
+  layout: Layout,
+  pub pts: Option<i64>,
+}
+
+pub(super) fn prepare_frame(
   buffer: &mut Buffer<'_>,
   format: VideoInfoRaw,
-) -> Result<Option<(RgbaImage, Option<i64>)>, CaptureError> {
+) -> Result<Option<PreparedFrame>, CaptureError> {
   let header = buffer.find_meta::<MetaHeader>();
   if header.is_some_and(|header| {
     header
@@ -132,6 +138,18 @@ pub(super) fn copy_frame(
   let bytes = data
     .data()
     .ok_or_else(|| backend("PipeWire 未映射共享内存缓冲区"))?;
+  rgba::validate_layout(bytes.len(), layout)?;
+  Ok(Some(PreparedFrame { layout, pts }))
+}
+
+pub(super) fn copy_frame(
+  buffer: &mut Buffer<'_>,
+  prepared: PreparedFrame,
+) -> Result<RgbaImage, CaptureError> {
+  let datas = buffer.datas_mut();
+  let bytes = datas[0]
+    .data()
+    .ok_or_else(|| backend("PipeWire 未映射共享内存缓冲区"))?;
   // MAP_BUFFERS 已处理 MemFd 的 mapoffset。必须在 Buffer Drop 归还前完成复制。
-  Ok(Some((rgba::convert(bytes, layout)?, pts)))
+  rgba::convert(bytes, prepared.layout)
 }

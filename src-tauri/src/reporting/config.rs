@@ -25,11 +25,46 @@ impl Region {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "CharacterConfig")]
 pub struct Character {
   pub title: String,
+  pub enabled: bool,
   pub warn_region: Region,
   pub reminder_now_region: Region,
+  pub reminder_gate_region: Region,
   pub reminder_enemy_region: Region,
+}
+
+#[derive(Deserialize)]
+struct CharacterConfig {
+  title: String,
+  #[serde(default = "default_enabled")]
+  enabled: bool,
+  warn_region: Region,
+  reminder_now_region: Region,
+  #[serde(default)]
+  reminder_gate_region: Option<Region>,
+  reminder_enemy_region: Region,
+}
+
+impl From<CharacterConfig> for Character {
+  fn from(config: CharacterConfig) -> Self {
+    Self {
+      title: config.title,
+      enabled: config.enabled,
+      warn_region: config.warn_region,
+      reminder_now_region: config.reminder_now_region,
+      // 旧配置保留原区域，并复制为前置区域的初始值，保持原有检测行为。
+      reminder_gate_region: config
+        .reminder_gate_region
+        .unwrap_or_else(|| config.reminder_enemy_region.clone()),
+      reminder_enemy_region: config.reminder_enemy_region,
+    }
+  }
+}
+
+fn default_enabled() -> bool {
+  true
 }
 
 impl Character {
@@ -37,6 +72,7 @@ impl Character {
     [
       &self.warn_region,
       &self.reminder_now_region,
+      &self.reminder_gate_region,
       &self.reminder_enemy_region,
     ]
     .iter()
@@ -80,6 +116,14 @@ pub struct Config {
 }
 
 impl Config {
+  pub fn into_monitoring(mut self) -> Result<Self, String> {
+    self.characters.retain(|c| c.enabled);
+    if self.characters.is_empty() {
+      return Err("请至少启用一个角色".into());
+    }
+    Ok(self)
+  }
+
   pub fn validate(&self) -> Result<(), String> {
     let mut titles = std::collections::HashSet::new();
     for c in &self.characters {
@@ -89,6 +133,7 @@ impl Config {
       for r in [
         &c.warn_region,
         &c.reminder_now_region,
+        &c.reminder_gate_region,
         &c.reminder_enemy_region,
       ] {
         if r.start[0] > r.end[0] || r.start[1] > r.end[1] || r.rgb.is_empty() {
@@ -213,19 +258,69 @@ pub fn config_path() -> Result<PathBuf, String> {
   }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ReminderStage {
+  LastWave,
+  Ended,
+}
+
+impl ReminderStage {
+  pub fn message(self) -> &'static str {
+    match self {
+      Self::LastWave => "异常进入最后一波次",
+      Self::Ended => "异常结束",
+    }
+  }
+}
+
 #[derive(Default)]
-pub struct ReminderState(bool, bool);
+pub enum ReminderState {
+  #[default]
+  Idle,
+  WaitingRgb2,
+  WaitingRgb3,
+  Rgb3Seen,
+  WaitingRgb1Clear,
+}
 
 impl ReminderState {
-  pub fn advance(&mut self, c: &Character, image: &RgbaImage) -> bool {
-    if !self.0 && !self.1 && c.reminder_now_region.matches(image) {
-      self.0 = true;
-    } else if self.0 && !self.1 && c.reminder_enemy_region.matches(image) {
-      self.1 = true;
-    } else if self.0 && self.1 && !c.reminder_enemy_region.matches(image) {
+  pub fn advance(&mut self, c: &Character, image: &RgbaImage) -> Option<ReminderStage> {
+    // 无效帧不能解释为颜色消失；与监控循环一样重置提醒状态。
+    if !c.fits(image) {
       *self = Self::default();
-      return true;
+      return None;
     }
-    false
+    let rgb1 = c.reminder_now_region.matches(image);
+    match self {
+      Self::Idle if rgb1 => {
+        *self = Self::WaitingRgb2;
+        self.advance_detection(c, image);
+        return Some(ReminderStage::LastWave);
+      }
+      Self::WaitingRgb2 | Self::WaitingRgb3 | Self::Rgb3Seen if !rgb1 => {
+        *self = Self::Idle;
+        return Some(ReminderStage::Ended);
+      }
+      // matches 对整个 RGB3 列表取任意命中；取反表示所有目标色均已消失。
+      Self::Rgb3Seen if !c.reminder_enemy_region.matches(image) => {
+        // RGB1 仍在，等待其消失，避免同一轮再次发送第一次提醒。
+        *self = Self::WaitingRgb1Clear;
+        return Some(ReminderStage::Ended);
+      }
+      Self::WaitingRgb1Clear if !rgb1 => *self = Self::Idle,
+      Self::WaitingRgb2 | Self::WaitingRgb3 => self.advance_detection(c, image),
+      _ => {}
+    }
+    None
+  }
+
+  fn advance_detection(&mut self, c: &Character, image: &RgbaImage) {
+    if matches!(self, Self::WaitingRgb2) && c.reminder_gate_region.matches(image) {
+      *self = Self::WaitingRgb3;
+    }
+    // 同帧满足前置条件后立即检测 RGB3；RGB2 后续消失不撤销前置记录。
+    if matches!(self, Self::WaitingRgb3) && c.reminder_enemy_region.matches(image) {
+      *self = Self::Rgb3Seen;
+    }
   }
 }

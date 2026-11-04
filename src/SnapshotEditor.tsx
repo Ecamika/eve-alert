@@ -25,7 +25,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import AddIcon from "@mui/icons-material/Add";
 import ImageSearchOutlinedIcon from "@mui/icons-material/ImageSearchOutlined";
 import { colorHex, hexRgb } from "./reporting";
-import type { Region, Snapshot } from "./reporting";
+import type { Region, RegionKey, Snapshot } from "./reporting";
 import {
   clamp,
   drawnRegion,
@@ -43,6 +43,14 @@ type Props = {
   region: Region;
   locked: boolean;
   onChange: (region: Region) => void;
+  regionKey?: RegionKey;
+  regions?: {
+    key: RegionKey;
+    label: string;
+    region: Region;
+    color: string;
+  }[];
+  onSelectRegion?: (key: RegionKey) => void;
 };
 type Drag = {
   pointerId: number;
@@ -58,6 +66,9 @@ export default function SnapshotEditor({
   region,
   locked,
   onChange,
+  regionKey,
+  regions,
+  onSelectRegion,
 }: Props) {
   const [mode, setMode] = useState<"region" | "color" | "pan">("region");
   const [zoom, setZoom] = useState<number | null>(null);
@@ -77,6 +88,8 @@ export default function SnapshotEditor({
   const drag = useRef<Drag | null>(null);
   const anchor = useRef<Point | null>(null);
   const current = draft ?? region;
+  const activeRegion = regions?.find((option) => option.key === regionKey);
+  const selectionColor = activeRegion?.color ?? "#6554c0";
   const valid = snapshot
     ? validRegion(current, snapshot.width, snapshot.height)
     : true;
@@ -306,6 +319,42 @@ export default function SnapshotEditor({
 
   const content = (
     <Box className={`snapshot-editor ${expanded ? "expanded" : ""}`}>
+      {regions && onSelectRegion && (
+        <Box sx={{ mb: 2 }}>
+          <ToggleButtonGroup
+            exclusive
+            value={regionKey}
+            onChange={(_, value: RegionKey | null) => {
+              if (!value) return;
+              drag.current = null;
+              setDraft(null);
+              onSelectRegion(value);
+            }}
+            aria-label="当前编辑的提醒区域"
+            sx={{ mb: 1, flexWrap: "wrap" }}
+          >
+            {regions.map((option) => (
+              <ToggleButton key={option.key} value={option.key} sx={{ gap: 1 }}>
+                <span
+                  className="color-swatch"
+                  style={{ backgroundColor: option.color }}
+                />
+                {option.label}
+                {snapshot &&
+                  !validRegion(
+                    option.region,
+                    snapshot.width,
+                    snapshot.height,
+                  ) && <Chip size="small" color="error" label="越界" />}
+              </ToggleButton>
+            ))}
+          </ToggleButtonGroup>
+          <Typography variant="body2" color="text.secondary">
+            同一张截图显示三个独立选框。当前编辑：{activeRegion?.label}
+            ；框选、移动、缩放和取色仅修改当前区域。各区域允许重叠。
+          </Typography>
+        </Box>
+      )}
       <Stack
         className="editor-toolbar"
         direction="row"
@@ -421,6 +470,31 @@ export default function SnapshotEditor({
               alt="当前角色的原始截图"
               draggable={false}
             />
+            {regions
+              ?.filter((option) => option.key !== regionKey)
+              .map((option) =>
+                validRegion(option.region, snapshot.width, snapshot.height) ? (
+                  <div
+                    key={option.key}
+                    className="selection-box selection-secondary"
+                    style={{
+                      left: `${(option.region.start[0] / snapshot.width) * 100}%`,
+                      top: `${(option.region.start[1] / snapshot.height) * 100}%`,
+                      width: `${((option.region.end[0] - option.region.start[0] + 1) / snapshot.width) * 100}%`,
+                      height: `${((option.region.end[1] - option.region.start[1] + 1) / snapshot.height) * 100}%`,
+                      outlineColor: option.color,
+                      backgroundColor: `${option.color}1a`,
+                    }}
+                  >
+                    <span
+                      className="selection-label"
+                      style={{ backgroundColor: option.color }}
+                    >
+                      {option.label}
+                    </span>
+                  </div>
+                ) : null,
+              )}
             {valid && (
               <>
                 <div
@@ -431,10 +505,22 @@ export default function SnapshotEditor({
                     top: `${(current.start[1] / snapshot.height) * 100}%`,
                     width: `${((current.end[0] - current.start[0] + 1) / snapshot.width) * 100}%`,
                     height: `${((current.end[1] - current.start[1] + 1) / snapshot.height) * 100}%`,
+                    outlineColor: selectionColor,
+                    backgroundColor: `${selectionColor}1a`,
+                    boxShadow: regions ? "none" : undefined,
                     pointerEvents:
                       mode === "region" && !locked ? "auto" : "none",
                   }}
-                />
+                >
+                  {activeRegion && (
+                    <span
+                      className="selection-label selection-label-active"
+                      style={{ backgroundColor: selectionColor }}
+                    >
+                      {activeRegion.label} · 当前
+                    </span>
+                  )}
+                </div>
                 {mode === "region" &&
                   !locked &&
                   handles.map((handle) => {
@@ -447,6 +533,7 @@ export default function SnapshotEditor({
                         style={{
                           left: `${(p[0] / snapshot.width) * 100}%`,
                           top: `${(p[1] / snapshot.height) * 100}%`,
+                          borderColor: selectionColor,
                         }}
                       />
                     );
@@ -543,6 +630,11 @@ export default function SnapshotEditor({
         </Stack>
       )}
       <Divider sx={{ mb: 2 }} />
+      {activeRegion && (
+        <Typography variant="subtitle2" sx={{ mb: 1.5 }}>
+          {activeRegion.label} · 独立坐标与目标颜色
+        </Typography>
+      )}
       <Stack
         direction="row"
         useFlexGap
@@ -609,11 +701,24 @@ export default function SnapshotEditor({
         </Alert>
       )}
       <Typography variant="subtitle2" sx={{ mb: 1 }}>
-        目标颜色{" "}
+        {activeRegion ? `${activeRegion.label} 目标颜色` : "目标颜色"}{" "}
         <Typography component="span" variant="caption" color="text.secondary">
           / RGB 精确匹配
         </Typography>
       </Typography>
+      {regionKey === "reminder_gate_region" && (
+        <Alert severity="info" icon={false} sx={{ mb: 1.5 }}>
+          RGB1 开启本轮后，区域 2 命中任意一种 RGB2 即开启区域 3 检测。
+          同帧已有 RGB3 时立即记录；RGB2 后续消失不会结束本轮，也不会关闭区域 3 检测。
+        </Alert>
+      )}
+      {regionKey === "reminder_enemy_region" && (
+        <Alert severity="info" icon={false} sx={{ mb: 1.5 }}>
+          区域 2 命中 RGB2 后才开始检测。RGB3 列表中任意一种颜色出现就记录，无需全部出现。记录后，只要区域 3
+          仍匹配任意一种颜色，就继续等待；所有配置颜色都消失才提醒“异常结束”。
+          区域 1 的 RGB1 消失也会独立触发结束。
+        </Alert>
+      )}
       <Stack
         direction="row"
         useFlexGap

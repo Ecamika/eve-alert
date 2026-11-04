@@ -8,14 +8,22 @@ import {
   Card,
   Chip,
   Container,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
   Divider,
   IconButton,
   LinearProgress,
   List,
+  ListItem,
   ListItemAvatar,
   ListItemButton,
   ListItemText,
+  MenuItem,
   Stack,
+  Switch,
   Tab,
   Tabs,
   TextField,
@@ -41,7 +49,12 @@ import CameraAltOutlinedIcon from "@mui/icons-material/CameraAltOutlined";
 import DownloadOutlinedIcon from "@mui/icons-material/DownloadOutlined";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import HistoryIcon from "@mui/icons-material/History";
-import { invoke, newCharacter, regionNames } from "./reporting";
+import {
+  copyCharacterRegions,
+  invoke,
+  newCharacter,
+  regionNames,
+} from "./reporting";
 import type {
   Config,
   Region,
@@ -61,6 +74,7 @@ export default function App() {
   });
   const [path, setPath] = useState("");
   const [selected, setSelected] = useState(0);
+  const [copyTarget, setCopyTarget] = useState<number | null>(null);
   const [regionKey, setRegionKey] = useState<RegionKey>("warn_region");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [status, setStatus] = useState<Status>({ running: false, sources: [] });
@@ -72,7 +86,9 @@ export default function App() {
   );
   const sounds = useRef(new Map<string, HTMLAudioElement>());
   const character = config.characters[selected];
+  const enabledCount = config.characters.filter((c) => c.enabled).length;
   const region = character?.[regionKey];
+  const regionGroup = regionKey === "warn_region" ? "warn_region" : "reminder";
   const [loaded, setLoaded] = useState(false);
   const { mode, setMode } = useColorScheme();
   const desktop = Boolean(window.__TAURI__);
@@ -303,7 +319,10 @@ export default function App() {
               color={status.running ? "error" : "primary"}
               startIcon={status.running ? <StopIcon /> : <PlayArrowIcon />}
               disabled={
-                busy || !loaded || (!character && !status.running) || !desktop
+                busy ||
+                !loaded ||
+                (enabledCount === 0 && !status.running) ||
+                !desktop
               }
               onClick={() =>
                 void action(async () => {
@@ -374,7 +393,7 @@ export default function App() {
                   variant="caption"
                   color="text.secondary"
                 >
-                  {config.characters.length}
+                  {enabledCount} / {config.characters.length} 已启用
                 </Typography>
               </Typography>
               <Tooltip title="添加角色">
@@ -413,58 +432,83 @@ export default function App() {
             )}
             <List disablePadding aria-label="监控角色列表" sx={{ mb: 2 }}>
               {config.characters.map((c, i) => (
-                <ListItemButton
+                <ListItem
                   key={i}
-                  selected={selected === i}
-                  disabled={busy}
-                  onClick={() => {
-                    if (selected !== i) {
-                      setSelected(i);
-                      setSnapshot(null);
-                    }
-                  }}
-                  sx={{ borderRadius: 2, px: 1, my: 0.5 }}
-                >
-                  <ListItemAvatar sx={{ minWidth: 44 }}>
-                    <Avatar
-                      sx={{
-                        width: 32,
-                        height: 32,
-                        fontSize: 13,
-                        bgcolor:
-                          selected === i ? "primary.main" : "action.selected",
-                        color:
-                          selected === i
-                            ? "primary.contrastText"
-                            : "text.secondary",
+                  disablePadding
+                  secondaryAction={
+                    <Switch
+                      size="small"
+                      checked={c.enabled}
+                      disabled={locked}
+                      slotProps={{
+                        input: { "aria-label": `启用角色 ${c.title}` },
                       }}
-                    >
-                      {String(i + 1).padStart(2, "0")}
-                    </Avatar>
-                  </ListItemAvatar>
-                  <ListItemText
-                    primary={c.title || "未命名角色"}
-                    secondary={
-                      status.sources.includes(c.title)
-                        ? "● 来源已连接"
-                        : "等待选择来源"
-                    }
-                    slotProps={{
-                      primary: {
-                        variant: "body2",
-                        sx: { fontWeight: 600, overflowWrap: "anywhere" },
-                      },
-                      secondary: {
-                        variant: "caption",
-                        sx: {
-                          color: status.sources.includes(c.title)
-                            ? "success.main"
-                            : "text.secondary",
-                        },
-                      },
+                      onChange={(_, enabled) =>
+                        setConfig((old) => ({
+                          ...old,
+                          characters: old.characters.map((item, index) =>
+                            index === i ? { ...item, enabled } : item,
+                          ),
+                        }))
+                      }
+                    />
+                  }
+                >
+                  <ListItemButton
+                    selected={selected === i}
+                    disabled={busy}
+                    onClick={() => {
+                      if (selected !== i) {
+                        setSelected(i);
+                        setSnapshot(null);
+                      }
                     }}
-                  />
-                </ListItemButton>
+                    sx={{ borderRadius: 2, pl: 1, pr: 7, my: 0.5 }}
+                  >
+                    <ListItemAvatar sx={{ minWidth: 44 }}>
+                      <Avatar
+                        sx={{
+                          width: 32,
+                          height: 32,
+                          fontSize: 13,
+                          bgcolor:
+                            selected === i ? "primary.main" : "action.selected",
+                          color:
+                            selected === i
+                              ? "primary.contrastText"
+                              : "text.secondary",
+                        }}
+                      >
+                        {String(i + 1).padStart(2, "0")}
+                      </Avatar>
+                    </ListItemAvatar>
+                    <ListItemText
+                      primary={c.title || "未命名角色"}
+                      secondary={
+                        !c.enabled
+                          ? "已禁用"
+                          : status.sources.includes(c.title)
+                            ? "● 来源已连接"
+                            : "等待选择来源"
+                      }
+                      slotProps={{
+                        primary: {
+                          variant: "body2",
+                          sx: { fontWeight: 600, overflowWrap: "anywhere" },
+                        },
+                        secondary: {
+                          variant: "caption",
+                          sx: {
+                            color:
+                              c.enabled && status.sources.includes(c.title)
+                                ? "success.main"
+                                : "text.secondary",
+                          },
+                        },
+                      }}
+                    />
+                  </ListItemButton>
+                </ListItem>
               ))}
             </List>
             {character && (
@@ -517,7 +561,19 @@ export default function App() {
                       );
                     }}
                   >
-                    复制角色配置
+                    复制为新角色
+                  </Button>
+                  <Button
+                    startIcon={<ContentCopyIcon />}
+                    disabled={locked || config.characters.length < 2}
+                    sx={{ justifyContent: "flex-start" }}
+                    onClick={() =>
+                      setCopyTarget(
+                        config.characters.findIndex((_, i) => i !== selected),
+                      )
+                    }
+                  >
+                    覆盖到其他角色
                   </Button>
                   <Button
                     startIcon={<LinkOffIcon />}
@@ -570,6 +626,8 @@ export default function App() {
                 每个角色独立识别 · 最高 2 FPS
                 <br />
                 停止监控后保留来源恢复凭据
+                <br />
+                停止监控后可切换角色启用状态
               </Typography>
             </Box>
           </Card>
@@ -667,38 +725,72 @@ export default function App() {
               </Stack>
             </Box>
             <Tabs
-              value={regionKey}
-              onChange={(_, value: RegionKey) => setRegionKey(value)}
+              value={regionGroup}
+              onChange={(_, value: "warn_region" | "reminder") =>
+                setRegionKey(
+                  value === "reminder" ? "reminder_now_region" : value,
+                )
+              }
               variant="scrollable"
               scrollButtons="auto"
               aria-label="识别区域类型"
               sx={{ px: 2, borderBottom: 1, borderColor: "divider" }}
             >
-              {(Object.keys(regionNames) as RegionKey[]).map((key, index) => (
-                <Tab
-                  id={`region-tab-${key}`}
-                  aria-controls={`region-panel-${key}`}
-                  key={key}
-                  value={key}
-                  disabled={busy}
-                  label={`${String(index + 1).padStart(2, "0")}  ${regionNames[key]}`}
-                />
-              ))}
+              <Tab
+                id="region-tab-warn_region"
+                aria-controls="region-panel-warn_region"
+                value="warn_region"
+                disabled={busy}
+                label="01  告警区域"
+              />
+              <Tab
+                id="region-tab-reminder"
+                aria-controls="region-panel-reminder"
+                value="reminder"
+                disabled={busy}
+                label="02  提醒配置"
+              />
             </Tabs>
             <Box
               role="tabpanel"
-              id={`region-panel-${regionKey}`}
-              aria-labelledby={`region-tab-${regionKey}`}
+              id={`region-panel-${regionGroup}`}
+              aria-labelledby={`region-tab-${regionGroup}`}
               sx={{ p: 2.5 }}
             >
               {character && region ? (
                 <>
                   <SnapshotEditor
-                    key={`${selected}-${regionKey}`}
+                    key={`${selected}-${regionGroup}`}
                     snapshot={snapshot}
                     region={region}
                     locked={locked}
                     onChange={updateRegion}
+                    regionKey={regionKey}
+                    regions={
+                      regionGroup === "reminder"
+                        ? [
+                            {
+                              key: "reminder_now_region",
+                              label: regionNames.reminder_now_region,
+                              region: character.reminder_now_region,
+                              color: "#6554c0",
+                            },
+                            {
+                              key: "reminder_gate_region",
+                              label: regionNames.reminder_gate_region,
+                              region: character.reminder_gate_region,
+                              color: "#c77800",
+                            },
+                            {
+                              key: "reminder_enemy_region",
+                              label: regionNames.reminder_enemy_region,
+                              region: character.reminder_enemy_region,
+                              color: "#00897b",
+                            },
+                          ]
+                        : undefined
+                    }
+                    onSelectRegion={setRegionKey}
                   />
                   <Alert
                     severity="info"
@@ -707,9 +799,7 @@ export default function App() {
                   >
                     {regionKey === "warn_region"
                       ? "告警：目标色首次出现时通知，持续命中不重复；全部消失后发送一次解除。"
-                      : regionKey === "reminder_now_region"
-                        ? "提醒第 1 步：准备区域命中后，开始等待敌人出现。"
-                        : "提醒第 2–3 步：敌人区域命中后，等待目标色消失，发送一次提醒并重置。"}
+                      : "区域 1 出现 RGB1 时提醒“异常进入最后一波次”，开启区域 2 检测；区域 2 命中任意一种 RGB2 后开启区域 3 检测，RGB2 后续消失不影响检测。区域 3 记录到任意一种 RGB3 后，所有 RGB3 都消失才提醒“异常结束”。区域 1 的 RGB1 消失也会结束本轮。结束后等待 RGB1 消失并重新出现，才开始下一轮。"}
                   </Alert>
                 </>
               ) : (
@@ -724,7 +814,8 @@ export default function App() {
                   <CropPlaceholder />
                   <Typography variant="h6">先添加一个监控角色</Typography>
                   <Typography variant="body2" color="text.secondary">
-                    每个角色可以独立配置三个区域与多组目标颜色。
+                    每个角色可配置告警区域，并在提醒配置中分别设置三个区域与
+                    RGB。
                   </Typography>
                   <Button
                     startIcon={<AddIcon />}
@@ -816,6 +907,7 @@ export default function App() {
                   />
                   <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
                     {event.title}
+                    {event.type === "Reminder" && `：${event.message}`}
                   </Typography>
                 </Stack>
               ))}
@@ -838,6 +930,74 @@ export default function App() {
           配置文件：{path || "尚未读取"} · 更换窗口或屏幕时，请重新获取来源。
         </Typography>
       </Container>
+      <Dialog
+        open={copyTarget !== null}
+        onClose={() => setCopyTarget(null)}
+        fullWidth
+        maxWidth="sm"
+        aria-labelledby="copy-character-title"
+      >
+        <DialogTitle id="copy-character-title">
+          覆盖其他角色的识别配置
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            将“{character?.title}”的告警区域、三个提醒区域及各自 RGB
+            覆盖到目标角色。
+            目标角色的名称、来源授权和启用状态保留。完成后请保存配置。
+          </DialogContentText>
+          <TextField
+            select
+            fullWidth
+            label="目标角色"
+            value={copyTarget ?? ""}
+            disabled={locked}
+            onChange={(event) => setCopyTarget(Number(event.target.value))}
+          >
+            {config.characters.map((item, i) =>
+              i === selected ? null : (
+                <MenuItem key={i} value={i}>
+                  {item.title || `未命名角色 ${i + 1}`}
+                  {!item.enabled && "（已禁用）"}
+                </MenuItem>
+              ),
+            )}
+          </TextField>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCopyTarget(null)}>取消</Button>
+          <Button
+            variant="contained"
+            disabled={
+              locked ||
+              copyTarget === null ||
+              copyTarget === selected ||
+              !config.characters[copyTarget]
+            }
+            onClick={() => {
+              if (copyTarget === null || copyTarget === selected || !character)
+                return;
+              const target = config.characters[copyTarget];
+              if (!target) return;
+              setConfig((old) => ({
+                ...old,
+                characters: old.characters.map((item, i) =>
+                  i === copyTarget
+                    ? copyCharacterRegions(old.characters[selected], item)
+                    : item,
+                ),
+              }));
+              setCopyTarget(null);
+              setError("");
+              setMessage(
+                `已用“${character.title}”的识别配置覆盖“${target.title}”，请保存配置。`,
+              );
+            }}
+          >
+            确认覆盖
+          </Button>
+        </DialogActions>
+      </Dialog>
     </>
   );
 }

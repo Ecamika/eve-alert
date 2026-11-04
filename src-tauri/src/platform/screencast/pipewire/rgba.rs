@@ -1,6 +1,6 @@
 use std::{num::NonZeroU32, time::Duration};
 
-use image::{imageops, RgbaImage};
+use image::{RgbaImage, imageops};
 
 use super::{super::CaptureError, backend};
 
@@ -40,7 +40,7 @@ pub(super) fn dimensions(width: u32, height: u32) -> Result<usize, CaptureError>
   Ok(bytes)
 }
 
-pub(super) fn convert(bytes: &[u8], layout: Layout) -> Result<RgbaImage, CaptureError> {
+pub(super) fn validate_layout(bytes_len: usize, layout: Layout) -> Result<(), CaptureError> {
   dimensions(layout.width, layout.height)?;
   let row_bytes = layout.width as usize * 4;
   let stride = layout.stride.unsigned_abs() as usize;
@@ -51,10 +51,10 @@ pub(super) fn convert(bytes: &[u8], layout: Layout) -> Result<RgbaImage, Capture
     .checked_mul(layout.height as usize - 1)
     .and_then(|value| value.checked_add(row_bytes))
     .ok_or_else(|| backend("SPA 缓冲区大小溢出"))?;
-  let end = layout
+  layout
     .offset
     .checked_add(layout.size)
-    .filter(|end| *end <= bytes.len())
+    .filter(|end| *end <= bytes_len)
     .ok_or_else(|| backend("SPA chunk 超出缓冲区边界"))?;
   if needed > layout.size {
     return Err(backend("SPA chunk 不足以容纳图像"));
@@ -67,6 +67,18 @@ pub(super) fn convert(bytes: &[u8], layout: Layout) -> Result<RgbaImage, Capture
   {
     return Err(backend("SPA 裁剪区域超出图像边界"));
   }
+  if layout.transform > 7 {
+    return Err(backend("未知 SPA 图像方向"));
+  }
+  dimensions(width, height)?;
+  Ok(())
+}
+
+pub(super) fn convert(bytes: &[u8], layout: Layout) -> Result<RgbaImage, CaptureError> {
+  validate_layout(bytes.len(), layout)?;
+  let stride = layout.stride.unsigned_abs() as usize;
+  let end = layout.offset + layout.size;
+  let (x, y, width, height) = layout.crop.unwrap_or((0, 0, layout.width, layout.height));
   let mut pixels = Vec::with_capacity(dimensions(width, height)?);
   let bgr = matches!(layout.format, PixelFormat::Bgra | PixelFormat::Bgrx);
   let opaque = matches!(layout.format, PixelFormat::Bgrx | PixelFormat::Rgbx);
@@ -148,7 +160,7 @@ impl FrameClock {
 
 pub(super) struct FrameLimiter {
   interval: Option<Duration>,
-  delivered: Option<Duration>,
+  sampled: Option<Duration>,
 }
 
 impl FrameLimiter {
@@ -156,19 +168,32 @@ impl FrameLimiter {
     Self {
       // 向上取整，确保纳秒粒度下不会超过所请求的上限。
       interval: fps.map(|fps| Duration::from_nanos(1_000_000_000u64.div_ceil(fps.get() as u64))),
-      delivered: None,
+      sampled: None,
     }
   }
 
-  pub fn accepts(&mut self, elapsed: Duration) -> bool {
-    if self
+  pub fn remaining(&self, elapsed: Duration) -> Duration {
+    self
       .interval
-      .zip(self.delivered)
-      .is_some_and(|(interval, last)| elapsed.saturating_sub(last) < interval)
-    {
-      return false;
-    }
-    self.delivered = Some(elapsed);
-    true
+      .zip(self.sampled)
+      .map_or(Duration::ZERO, |(interval, last)| {
+        last.saturating_add(interval).saturating_sub(elapsed)
+      })
+  }
+
+  pub fn ready(&self, elapsed: Duration) -> bool {
+    self.remaining(elapsed).is_zero()
+  }
+
+  pub fn should_convert(&self, elapsed: Duration) -> bool {
+    // 提前窗口限制画面陈旧程度；短周期按比例缩小。发布仍严格受 ready 约束。
+    let early = self.interval.map_or(Duration::ZERO, |interval| {
+      (interval / 10).min(Duration::from_millis(50))
+    });
+    self.remaining(elapsed) <= early
+  }
+
+  pub fn record_sample(&mut self, elapsed: Duration) {
+    self.sampled = Some(elapsed);
   }
 }

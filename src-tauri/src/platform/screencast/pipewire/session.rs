@@ -34,15 +34,18 @@ pub(super) struct Mailbox {
 }
 
 impl Mailbox {
-  pub fn publish(&self, frame: ArcCaptureFrame) {
+  pub fn publish(&self, frame: ArcCaptureFrame) -> bool {
     // 消费者只在 poll 内短暂持锁，原生线程不等待异步消费者。
     // 竞争时直接丢帧，避免阻塞 PipeWire 回调。
-    if let Ok(mut slot) = self.slot.try_lock() {
-      if !slot.ended {
-        slot.frame = Some(frame);
-      }
+    let mut published = false;
+    if let Ok(mut slot) = self.slot.try_lock()
+      && !slot.ended
+    {
+      slot.frame = Some(frame);
+      published = true;
     }
     self.waker.wake();
+    published
   }
 
   pub fn finish(&self, error: Option<CaptureError>) {

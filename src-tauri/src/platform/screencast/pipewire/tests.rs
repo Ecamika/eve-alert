@@ -1,8 +1,8 @@
 use std::{
   num::NonZeroU32,
   sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
   },
   task::{Context, Wake, Waker},
   time::Duration,
@@ -14,7 +14,7 @@ use image::RgbaImage;
 use super::{
   super::*,
   portal::map_capabilities,
-  rgba::{convert, FrameClock, FrameLimiter, Layout, PixelFormat},
+  rgba::{FrameClock, FrameLimiter, Layout, PixelFormat, convert},
   session::{Cleanup, Control, Session},
 };
 
@@ -218,9 +218,11 @@ fn maps_only_actual_portal_capabilities() {
     map_capabilities(4, 1, 1).restore_kinds,
     [SelectionKind::Display, SelectionKind::Any]
   );
-  assert!(!map_capabilities(2, 3, 3)
-    .picker_kinds
-    .contains(&SelectionKind::Any));
+  assert!(
+    !map_capabilities(2, 3, 3)
+      .picker_kinds
+      .contains(&SelectionKind::Any)
+  );
   assert_eq!(
     map_capabilities(1, 1, 1).picker_kinds,
     [SelectionKind::Display, SelectionKind::Any]
@@ -355,16 +357,20 @@ async fn dropping_one_source_only_stops_it_and_dropping_the_last_stops_the_group
   let mut session = make_multi_session(&control);
   let first = session.take_frames(&SourceId("test".into())).unwrap();
   drop(first);
-  assert!(control
-    .source(&SourceId("test".into()))
-    .unwrap()
-    .stopped
-    .load(Ordering::Acquire));
-  assert!(!control
-    .source(&SourceId("other".into()))
-    .unwrap()
-    .stopped
-    .load(Ordering::Acquire));
+  assert!(
+    control
+      .source(&SourceId("test".into()))
+      .unwrap()
+      .stopped
+      .load(Ordering::Acquire)
+  );
+  assert!(
+    !control
+      .source(&SourceId("other".into()))
+      .unwrap()
+      .stopped
+      .load(Ordering::Acquire)
+  );
   assert!(!control.stopped.load(Ordering::Acquire));
   // 未取出的另一路仍然运行，并保留自己的最新帧。
   publish(&control, frame_from("other", 7));
@@ -475,14 +481,18 @@ fn failing_a_source_wakes_only_its_waiter() {
   let second_wakes = Arc::new(WakeCounter::default());
   let first_waker = Waker::from(first_wakes.clone());
   let second_waker = Waker::from(second_wakes.clone());
-  assert!(first
-    .as_mut()
-    .poll_next(&mut Context::from_waker(&first_waker))
-    .is_pending());
-  assert!(second
-    .as_mut()
-    .poll_next(&mut Context::from_waker(&second_waker))
-    .is_pending());
+  assert!(
+    first
+      .as_mut()
+      .poll_next(&mut Context::from_waker(&first_waker))
+      .is_pending()
+  );
+  assert!(
+    second
+      .as_mut()
+      .poll_next(&mut Context::from_waker(&second_waker))
+      .is_pending()
+  );
   control.fail_source(
     &control.source(&first_id).unwrap(),
     CaptureError::SourceUnavailable(first_id),
@@ -511,14 +521,18 @@ fn publishing_a_frame_only_wakes_its_source_consumer() {
   let second_wakes = Arc::new(WakeCounter::default());
   let first_waker = Waker::from(first_wakes.clone());
   let second_waker = Waker::from(second_wakes.clone());
-  assert!(first
-    .as_mut()
-    .poll_next(&mut Context::from_waker(&first_waker))
-    .is_pending());
-  assert!(second
-    .as_mut()
-    .poll_next(&mut Context::from_waker(&second_waker))
-    .is_pending());
+  assert!(
+    first
+      .as_mut()
+      .poll_next(&mut Context::from_waker(&first_waker))
+      .is_pending()
+  );
+  assert!(
+    second
+      .as_mut()
+      .poll_next(&mut Context::from_waker(&second_waker))
+      .is_pending()
+  );
   publish(&control, frame(0));
   assert_eq!(first_wakes.0.load(Ordering::Relaxed), 1);
   assert_eq!(second_wakes.0.load(Ordering::Relaxed), 0);
@@ -680,14 +694,16 @@ fn dropping_stop_future_does_not_cancel_the_stop_request() {
 #[test]
 fn limits_delivery_without_rounding_above_requested_fps() {
   let mut limiter = FrameLimiter::new(std::num::NonZeroU32::new(30));
-  assert!(limiter.accepts(Duration::ZERO));
-  assert!(!limiter.accepts(Duration::from_nanos(33_333_333)));
-  assert!(limiter.accepts(Duration::from_nanos(33_333_334)));
-  assert!(!limiter.accepts(Duration::from_millis(40)));
-  assert!(limiter.accepts(Duration::from_millis(80)));
-  let mut unlimited = FrameLimiter::new(None);
+  assert!(limiter.ready(Duration::ZERO));
+  limiter.record_sample(Duration::ZERO);
+  assert!(!limiter.ready(Duration::from_nanos(33_333_333)));
+  assert!(limiter.ready(Duration::from_nanos(33_333_334)));
+  limiter.record_sample(Duration::from_nanos(33_333_334));
+  assert!(!limiter.ready(Duration::from_millis(40)));
+  assert!(limiter.ready(Duration::from_millis(80)));
+  let unlimited = FrameLimiter::new(None);
   for _ in 0..10 {
-    assert!(unlimited.accepts(Duration::ZERO));
+    assert!(unlimited.ready(Duration::ZERO));
   }
 }
 

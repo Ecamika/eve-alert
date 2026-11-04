@@ -5,8 +5,10 @@ export type Region = {
 };
 export type Character = {
   title: string;
+  enabled: boolean;
   warn_region: Region;
   reminder_now_region: Region;
+  reminder_gate_region: Region;
   reminder_enemy_region: Region;
 };
 export type Method =
@@ -27,10 +29,14 @@ export type Method =
       try_spacing: { secs: number; nanos: number };
     };
 export type Config = { characters: Character[]; report_methods: Method[] };
-export type ReportEvent = {
-  type: "Warn" | "WarnCleared" | "Reminder";
-  title: string;
-};
+export type ReportEvent =
+  | { type: "Warn" | "WarnCleared"; title: string }
+  | {
+      type: "Reminder";
+      title: string;
+      stage: "LastWave" | "Ended";
+      message: string;
+    };
 export type Snapshot = { data_url: string; width: number; height: number };
 export type Status = { running: boolean; sources: string[] };
 
@@ -62,8 +68,9 @@ export function invoke<T>(
 }
 export const regionNames = {
   warn_region: "告警区域",
-  reminder_now_region: "提醒准备区域",
-  reminder_enemy_region: "敌人出现区域",
+  reminder_now_region: "区域 1 / RGB1",
+  reminder_gate_region: "区域 2 / RGB2",
+  reminder_enemy_region: "区域 3 / RGB3",
 } as const;
 export type RegionKey = keyof typeof regionNames;
 export function newCharacter(index: number): Character {
@@ -74,9 +81,25 @@ export function newCharacter(index: number): Character {
   });
   return {
     title: `EVE - 角色${index}`,
+    enabled: true,
     warn_region: region(),
     reminder_now_region: region(),
+    reminder_gate_region: region(),
     reminder_enemy_region: region(),
+  };
+}
+export function copyCharacterRegions(
+  source: Character,
+  target: Character,
+): Character {
+  return {
+    ...target,
+    ...structuredClone({
+      warn_region: source.warn_region,
+      reminder_now_region: source.reminder_now_region,
+      reminder_gate_region: source.reminder_gate_region,
+      reminder_enemy_region: source.reminder_enemy_region,
+    }),
   };
 }
 export function colorHex(rgb: number[]): string {

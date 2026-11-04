@@ -2,6 +2,7 @@ use std::{
   cell::{Cell, RefCell},
   collections::HashSet,
   io::Cursor,
+  num::NonZeroU32,
   os::fd::OwnedFd,
   rc::Rc,
   sync::{Arc, atomic::Ordering},
@@ -27,6 +28,7 @@ use tokio::sync::oneshot;
 use super::{
   super::*,
   backend, buffer, caused_by,
+  diagnostics::FrameStats,
   portal::Target,
   rgba::{self, FrameClock, FrameLimiter},
   session::{Control, SourceControl},
@@ -38,8 +40,8 @@ fn serialize(object: Object) -> Result<Vec<u8>, CaptureError> {
     .map_err(|error| backend(format!("无法序列化 SPA 参数：{error:?}")))
 }
 
-fn format_param() -> Result<Vec<u8>, CaptureError> {
-  serialize(spa::pod::object!(
+fn format_param(max_fps: Option<NonZeroU32>) -> Result<Vec<u8>, CaptureError> {
+  let mut object = spa::pod::object!(
     SpaTypes::ObjectParamFormat,
     ParamType::EnumFormat,
     spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
@@ -78,14 +80,35 @@ fn format_param() -> Result<Vec<u8>, CaptureError> {
       Choice,
       Range,
       Fraction,
-      spa::utils::Fraction { num: 60, denom: 1 },
+      spa::utils::Fraction {
+        num: if max_fps.is_some() { 0 } else { 60 },
+        denom: 1
+      },
       spa::utils::Fraction { num: 0, denom: 1 },
       spa::utils::Fraction {
-        num: 1000,
+        num: max_fps.map_or(1000, NonZeroU32::get),
         denom: 1
       }
     ),
-  ))
+  );
+  if let Some(fps) = max_fps {
+    object.properties.push(spa::pod::property!(
+      FormatProperties::VideoMaxFramerate,
+      Choice,
+      Range,
+      Fraction,
+      spa::utils::Fraction {
+        num: fps.get(),
+        denom: 1
+      },
+      spa::utils::Fraction { num: 1, denom: 1 },
+      spa::utils::Fraction {
+        num: fps.get(),
+        denom: 1
+      }
+    ));
+  }
+  serialize(object)
 }
 
 fn buffer_params() -> Result<Vec<Vec<u8>>, CaptureError> {
@@ -94,16 +117,29 @@ fn buffer_params() -> Result<Vec<Vec<u8>>, CaptureError> {
   let mut params = vec![serialize(Object {
     type_: SpaTypes::ObjectParamBuffers.as_raw(),
     id: ParamType::Buffers.as_raw(),
-    properties: vec![spa::pod::Property::new(
-      spa::sys::SPA_PARAM_BUFFERS_dataType,
-      Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
-        spa::utils::ChoiceFlags::empty(),
-        spa::utils::ChoiceEnum::Flags {
-          default: mask,
-          flags: vec![mask],
-        },
-      ))),
-    )],
+    properties: vec![
+      spa::pod::Property::new(
+        spa::sys::SPA_PARAM_BUFFERS_buffers,
+        Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+          spa::utils::ChoiceFlags::empty(),
+          spa::utils::ChoiceEnum::Range {
+            default: 8,
+            min: 2,
+            max: 32,
+          },
+        ))),
+      ),
+      spa::pod::Property::new(
+        spa::sys::SPA_PARAM_BUFFERS_dataType,
+        Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+          spa::utils::ChoiceFlags::empty(),
+          spa::utils::ChoiceEnum::Flags {
+            default: mask,
+            flags: vec![mask],
+          },
+        ))),
+      ),
+    ],
   })?];
   for (kind, size) in [
     (
@@ -143,13 +179,148 @@ struct StreamData {
   clock: FrameClock,
   start: Instant,
   limiter: FrameLimiter,
+  pending: Option<ArcCaptureFrame>,
+  stats: FrameStats,
 }
 
 impl StreamData {
-  fn fail(&self, error: CaptureError) {
+  fn format_changed(&mut self, param: Option<&Pod>) -> Result<Option<VideoInfoRaw>, CaptureError> {
+    // 清空旧尺寸对应的待发布图像，但保留限速状态，重协商不能形成交付突发。
+    self.format = None;
+    self.pending = None;
+    let Some(param) = param else { return Ok(None) };
+    let mut format = VideoInfoRaw::default();
+    let (media, subtype) = spa::param::format_utils::parse_format(param)
+      .map_err(|error| caused_by("无法解析 PipeWire 媒体类型", error))?;
+    if media != MediaType::Video || subtype != MediaSubtype::Raw {
+      return Err(backend("PipeWire 未协商原始视频格式"));
+    }
+    format
+      .parse(param)
+      .map_err(|error| caused_by("无法解析 PipeWire 视频格式", error))?;
+    buffer::validate_format(format)?;
+    self.stats.negotiated(format);
+    Ok(Some(format))
+  }
+
+  fn fail(&mut self, error: CaptureError) {
+    self.pending = None;
     self
       .readiness
       .fail_source(&self.control, &self.source, error);
+  }
+
+  fn deliver_pending(&mut self, elapsed: Duration) {
+    if self.source.stopped.load(Ordering::Acquire) {
+      self.pending = None;
+      return;
+    }
+    if !self.limiter.ready(elapsed) {
+      return;
+    }
+    let Some(frame) = self.pending.take() else {
+      return;
+    };
+    // 该图像已成功转换。邮箱竞争也计作一次采样，避免竞争时反复整帧转换。
+    self.limiter.record_sample(elapsed);
+    if self.source.mailbox.publish(frame) {
+      self.stats.delivered(elapsed);
+    } else {
+      self.stats.mailbox_dropped += 1;
+    }
+  }
+
+  fn stage_frame(
+    &mut self,
+    elapsed: Duration,
+    timestamp: Duration,
+    sequence: u64,
+    copy: impl FnOnce() -> Result<image::RgbaImage, CaptureError>,
+  ) -> bool {
+    if self.source.stopped.load(Ordering::Acquire)
+      || self.pending.is_some()
+      || !self.limiter.should_convert(elapsed)
+    {
+      return false;
+    }
+    let started = Instant::now();
+    let result = copy();
+    self.stats.converted += 1;
+    self.stats.conversion(started.elapsed());
+    match result {
+      Ok(image) => {
+        self.pending = Some(Arc::new(CaptureFrame {
+          source_id: self.source_id.clone(),
+          image,
+          timestamp,
+          sequence,
+        }))
+      }
+      Err(error) => self.fail(error),
+    }
+    true
+  }
+
+  fn process(&mut self, stream: &pw::stream::Stream) {
+    // 固定本次队列快照，并持有所有 guard 到取帧结束，防止归还后被再次取出。
+    // 上限控制单次回调工作量；剩余画面交给下一次回调，不无界排空。
+    const MAX_BATCH: u32 = 32;
+    let count = stream
+      .time()
+      .map_or(1, |time| time.avail_buffers().min(MAX_BATCH));
+    let mut buffers = Vec::new();
+    for _ in 0..count {
+      let Some(buffer) = stream.dequeue_buffer() else {
+        break;
+      };
+      buffers.push(buffer);
+    }
+    let mut selected = None;
+    for (index, buffer) in buffers.iter_mut().enumerate() {
+      self.stats.received += 1;
+      if self.source.stopped.load(Ordering::Acquire) {
+        self.pending = None;
+        return;
+      }
+      let Some(format) = self.format else {
+        self.stats.invalid += 1;
+        continue;
+      };
+      // 即使限速，也检查坏帧、映射和布局错误；此步骤不分配像素图像。
+      match buffer::prepare_frame(buffer, format) {
+        Ok(Some(prepared)) => {
+          self.stats.valid += 1;
+          let elapsed = self.start.elapsed();
+          let (timestamp, sequence) = self.clock.next(prepared.pts, elapsed);
+          self.stats.skipped += 1;
+          if self.pending.is_none() && self.limiter.should_convert(elapsed) {
+            selected = Some((index, prepared, timestamp, sequence));
+          }
+        }
+        Ok(None) => self.stats.invalid += 1,
+        Err(error) => {
+          self.fail(error);
+          return;
+        }
+      }
+    }
+    // 本批只转换最后一个有效候选帧；坏帧不会覆盖较早的有效候选。
+    if let Some((index, prepared, timestamp, sequence)) = selected
+      && self.stage_frame(self.start.elapsed(), timestamp, sequence, || {
+        buffer::copy_frame(&mut buffers[index], prepared)
+      })
+    {
+      self.stats.skipped -= 1;
+    }
+    // 发布和限速时间在成功转换后读取，复制失败不消耗采样机会。
+    self.deliver_pending(self.start.elapsed());
+  }
+}
+
+impl Drop for StreamData {
+  fn drop(&mut self) {
+    self.pending = None;
+    self.stats.report(self.start.elapsed(), true);
   }
 }
 
@@ -328,6 +499,7 @@ pub(super) fn run(
   let mut registry_listeners = Vec::new();
   let mut stream_listeners = Vec::new();
   let mut metadata_nodes = Vec::new();
+  let mut stream_data = Vec::new();
   for (index, (source, target)) in targets.into_iter().enumerate() {
     let source_control = control
       .source(&source.id)
@@ -412,7 +584,7 @@ pub(super) fn run(
     let started_state = started.clone();
     let state_source = source.id.clone();
     let ready_state = readiness.clone();
-    let data = StreamData {
+    let data = Rc::new(RefCell::new(StreamData {
       source_id: source.id,
       source: source_control.clone(),
       format: None,
@@ -421,10 +593,14 @@ pub(super) fn run(
       clock: FrameClock::default(),
       start: session_start,
       limiter: FrameLimiter::new(options.max_fps),
-    };
+      pending: None,
+      stats: FrameStats::new(options.max_fps, session_start.elapsed()),
+    }));
+    stream_data.push(data.clone());
     let stream_listener = stream
       .add_local_listener_with_user_data(data)
       .state_changed(move |_, data, _, state| {
+        let mut data = data.borrow_mut();
         if data.source.stopped.load(Ordering::Acquire) {
           return;
         }
@@ -443,25 +619,14 @@ pub(super) fn run(
         }
       })
       .param_changed(|stream, data, id, param| {
+        let mut data = data.borrow_mut();
         if id != ParamType::Format.as_raw() || data.source.stopped.load(Ordering::Acquire) {
           return;
         }
-        // 重新协商时立即清空旧格式，尺寸从每次 Format 更新读取。
-        data.format = None;
-        let Some(param) = param else {
-          return;
-        };
         let result = (|| {
-          let mut format = VideoInfoRaw::default();
-          let (media, subtype) = spa::param::format_utils::parse_format(param)
-            .map_err(|error| caused_by("无法解析 PipeWire 媒体类型", error))?;
-          if media != MediaType::Video || subtype != MediaSubtype::Raw {
-            return Err(backend("PipeWire 未协商原始视频格式"));
-          }
-          format
-            .parse(param)
-            .map_err(|error| caused_by("无法解析 PipeWire 视频格式", error))?;
-          buffer::validate_format(format)?;
+          let Some(format) = data.format_changed(param)? else {
+            return Ok(());
+          };
           let bytes = buffer_params()?;
           let mut params = bytes
             .iter()
@@ -478,39 +643,11 @@ pub(super) fn run(
         }
       })
       .process(|stream, data| {
-        // 消费可用缓冲区，所有路径均由 Buffer Drop 自动归还。
-        while let Some(mut buffer) = stream.dequeue_buffer() {
-          if data.source.stopped.load(Ordering::Acquire) {
-            return;
-          }
-          let Some(format) = data.format else {
-            continue;
-          };
-          match buffer::copy_frame(&mut buffer, format) {
-            Ok(Some((image, pts))) => {
-              let elapsed = data.start.elapsed();
-              let (timestamp, sequence) = data.clock.next(pts, elapsed);
-              if !data.limiter.accepts(elapsed) {
-                continue;
-              }
-              data.source.mailbox.publish(Arc::new(CaptureFrame {
-                source_id: data.source_id.clone(),
-                image,
-                timestamp,
-                sequence,
-              }));
-            }
-            Ok(None) => {}
-            Err(error) => {
-              data.fail(error);
-              return;
-            }
-          }
-        }
+        data.borrow_mut().process(stream);
       })
       .register()
       .map_err(|error| caused_by("无法注册 PipeWire stream listener", error))?;
-    let bytes = format_param()?;
+    let bytes = format_param(options.max_fps)?;
     let mut params = [Pod::from_bytes(&bytes).ok_or_else(|| backend("SPA 格式参数无效"))?];
     stream
       .connect(
@@ -534,11 +671,24 @@ pub(super) fn run(
     Err(_) => readiness.metadata_ready(),
   }
   while !control.stopped.load(Ordering::Acquire) {
+    let mut timeout = Duration::from_millis(50);
     for index in 0..streams.len() {
+      if streams[index].is_none() {
+        continue;
+      }
+      let mut data = stream_data[index].borrow_mut();
+      let elapsed = session_start.elapsed();
+      data.deliver_pending(elapsed);
+      data.stats.report(elapsed, false);
+      if data.pending.is_some() {
+        timeout = timeout.min(data.limiter.remaining(elapsed));
+      }
       if streams[index]
         .as_ref()
         .is_some_and(|(source, _)| source.stopped.load(Ordering::Acquire))
       {
+        data.pending = None;
+        data.stats.report(elapsed, true);
         // 单路停止或异常：先撤销监听，再销毁 stream；不关闭共享 remote。
         // 销毁产生的状态/registry 通知不能被误判为整组来源异常。
         stream_listeners[index].take();
@@ -549,7 +699,7 @@ pub(super) fn run(
     }
     let result = main_loop
       .loop_()
-      .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
+      .iterate(pw::loop_::Timeout::Finite(timeout));
     if result < 0 {
       return Err(backend(format!("PipeWire 主循环失败（{result}）")));
     }
@@ -562,6 +712,187 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn data() -> StreamData {
+    let source = source("test");
+    let control = Control::new();
+    control.register_sources(std::slice::from_ref(&source));
+    let (ready, _) = oneshot::channel();
+    StreamData {
+      source_id: source.id.clone(),
+      source: control.source(&source.id).unwrap(),
+      format: None,
+      control,
+      readiness: Rc::new(StartupBarrier::new(vec![source], ready)),
+      clock: FrameClock::default(),
+      start: Instant::now(),
+      limiter: FrameLimiter::new(NonZeroU32::new(2)),
+      pending: None,
+      stats: FrameStats::new(NonZeroU32::new(2), Duration::ZERO),
+    }
+  }
+
+  fn sample(data: &mut StreamData, ms: u64, sequence: u64) -> bool {
+    let now = Duration::from_millis(ms);
+    data.stage_frame(now, now, sequence, || Ok(image::RgbaImage::new(1, 1)))
+  }
+
+  #[test]
+  fn jittered_upstream_keeps_sampling_without_exceeding_delivery_limit() {
+    let mut data = data();
+    assert!(sample(&mut data, 0, 0));
+    data.deliver_pending(Duration::ZERO);
+    for (index, arrival) in [499, 1001, 1499, 2000, 2498, 3001].into_iter().enumerate() {
+      assert!(sample(&mut data, arrival, index as u64 + 1));
+      // 早到帧只保留在独立的自有图像槽中，不提前发布。
+      let wait = data.limiter.remaining(Duration::from_millis(arrival));
+      data.deliver_pending(Duration::from_millis(arrival) + wait);
+      assert!(data.pending.is_none());
+      assert_eq!(
+        data
+          .limiter
+          .remaining(Duration::from_millis(arrival) + wait),
+        Duration::from_millis(500)
+      );
+    }
+    assert_eq!(data.stats.converted, 7);
+  }
+
+  #[test]
+  fn surplus_frames_skip_conversion_and_pending_is_bounded_and_cleared_on_stop() {
+    let mut first = data();
+    let mut second = data();
+    assert!(sample(&mut first, 0, 0));
+    first.deliver_pending(Duration::ZERO);
+    for ms in 1..450 {
+      assert!(
+        !first.stage_frame(Duration::from_millis(ms), Duration::ZERO, ms, || panic!(
+          "限速帧不应执行像素转换"
+        ))
+      );
+    }
+    assert!(sample(&mut first, 499, 1));
+    assert!(
+      !first.stage_frame(Duration::from_millis(499), Duration::ZERO, 2, || panic!(
+        "待发布槽最多一个图像"
+      ))
+    );
+    assert!(sample(&mut second, 1, 0));
+    second.deliver_pending(Duration::from_millis(1));
+    first.control.request_stop();
+    first.deliver_pending(Duration::from_millis(500));
+    assert!(first.pending.is_none());
+    assert!(!sample(&mut first, 1000, 3));
+    assert!(!second.source.stopped.load(Ordering::Acquire));
+  }
+
+  #[test]
+  fn unsuccessful_sampling_does_not_commit_limiter() {
+    let mut data = data();
+    assert!(data.stage_frame(Duration::ZERO, Duration::ZERO, 0, || Err(backend("坏帧"))));
+    assert!(data.pending.is_none());
+    assert!(data.limiter.ready(Duration::from_millis(1)));
+    assert!(data.source.stopped.load(Ordering::Acquire));
+  }
+
+  #[test]
+  fn resizing_discards_old_pending_image_without_resetting_delivery_limit() {
+    let mut data = data();
+    assert!(sample(&mut data, 0, 0));
+    data.deliver_pending(Duration::ZERO);
+    assert!(sample(&mut data, 499, 1));
+    for width in [640, 1280] {
+      let bytes = serialize(spa::pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::Format,
+        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        spa::pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::BGRA),
+        spa::pod::property!(
+          FormatProperties::VideoSize,
+          Rectangle,
+          Rectangle { width, height: 480 }
+        ),
+        spa::pod::property!(
+          FormatProperties::VideoFramerate,
+          Fraction,
+          spa::utils::Fraction { num: 0, denom: 1 }
+        ),
+        spa::pod::property!(
+          FormatProperties::VideoMaxFramerate,
+          Fraction,
+          spa::utils::Fraction { num: 2, denom: 1 }
+        )
+      ))
+      .unwrap();
+      let format = data
+        .format_changed(Pod::from_bytes(&bytes))
+        .unwrap()
+        .unwrap();
+      assert_eq!(format.size().width, width);
+      assert!(super::super::diagnostics::upstream_is_limited(
+        format,
+        NonZeroU32::new(2).unwrap()
+      ));
+      assert!(data.pending.is_none());
+      assert!(!data.limiter.ready(Duration::from_millis(499)));
+      assert!(data.limiter.ready(Duration::from_millis(500)));
+    }
+  }
+
+  #[test]
+  fn format_choices_bound_both_variable_and_fixed_rates_without_limiting_none() {
+    use spa::{
+      pod::{ChoiceValue, deserialize::PodDeserializer},
+      utils::{Choice, ChoiceEnum, Fraction},
+    };
+    for requested in [None, NonZeroU32::new(2), NonZeroU32::new(30)] {
+      let bytes = format_param(requested).unwrap();
+      let (_, Value::Object(object)) = PodDeserializer::deserialize_any_from(&bytes).unwrap()
+      else {
+        panic!()
+      };
+      let property =
+        |key: FormatProperties| object.properties.iter().find(|p| p.key == key.as_raw());
+      let framerate = &property(FormatProperties::VideoFramerate).unwrap().value;
+      let maxrate = property(FormatProperties::VideoMaxFramerate);
+      if let Some(fps) = requested {
+        assert_eq!(
+          *framerate,
+          Value::Choice(ChoiceValue::Fraction(Choice(
+            spa::utils::ChoiceFlags::empty(),
+            ChoiceEnum::Range {
+              default: Fraction { num: 0, denom: 1 },
+              min: Fraction { num: 0, denom: 1 },
+              max: Fraction {
+                num: fps.get(),
+                denom: 1
+              },
+            }
+          )))
+        );
+        assert_eq!(
+          maxrate.unwrap().value,
+          Value::Choice(ChoiceValue::Fraction(Choice(
+            spa::utils::ChoiceFlags::empty(),
+            ChoiceEnum::Range {
+              default: Fraction {
+                num: fps.get(),
+                denom: 1
+              },
+              min: Fraction { num: 1, denom: 1 },
+              max: Fraction {
+                num: fps.get(),
+                denom: 1
+              },
+            }
+          )))
+        );
+      } else {
+        assert!(maxrate.is_none());
+      }
+    }
+  }
 
   fn source(id: &str) -> CaptureSource {
     CaptureSource {

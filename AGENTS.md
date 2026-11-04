@@ -10,7 +10,7 @@ EVE Alert（`eve-alert`）是面向 EVE Online 的屏幕 RGB 识别与告警桌�
 
 - `src/App.tsx`、`src/App.css`：角色与来源配置、监控控制、页面布局及事件展示。
 - `src/theme.ts`：MUI 主题、浅色与深色配色及组件默认样式。
-- `src/SnapshotEditor.tsx`、`src/selection.ts`：截图缩放、框选、移动与缩放选区、原始像素取色和坐标计算。
+- `src/SnapshotEditor.tsx`、`src/selection.ts`：截图缩放、框选、移动与缩放选区、原始像素取色和坐标计算；提醒配置在同一个编辑页及全屏窗口中切换三个独立区域，同时显示三个选框。
 - `src/NotificationSettings.tsx`：通知渠道配置表单。
 - `src/reporting.ts`：前端业务类型与 Tauri IPC 封装；修改命令或序列化结构时同步检查此处。
 - `src-tauri/src/main.rs`：程序入口；`lib.rs`：Tauri 初始化、状态管理与命令注册。
@@ -19,7 +19,7 @@ EVE Alert（`eve-alert`）是面向 EVE Online 的屏幕 RGB 识别与告警桌�
 - `src-tauri/src/reporting/capture.rs`：来源选择和恢复凭据存储；`outputs.rs`：SSE、WebSocket、桌面通知、ntfy 与 OneBot 输出。
 - `src-tauri/src/platform/screencast/`：共享捕获接口和数据模型；`pipewire/`：Linux Portal / PipeWire 实现。
 - `src-tauri/src/plugin/`：内置插件、服务契约与生命周期管理，具体约定见该目录的 `README.md`；当前业务由 Tauri 直接管理，勿假定已接入插件生命周期。
-- `src-tauri/tauri.conf.json`、`capabilities/`：应用配置与权限；`flake.nix`：开发环境；`public/`、`src/assets/`、`src-tauri/icons/`：静态资源与图标。
+- `src-tauri/tauri.conf.json`、`capabilities/`：应用配置与权限；`flake.nix`：NixOS 软件包与开发环境；`public/`、`src/assets/`、`src-tauri/icons/`：静态资源与图标。
 
 业务规则留在 `reporting/`，平台细节放入对应平台子模块，共享捕获契约留在 `screencast/` 上层。避免将识别逻辑或平台细节直接放入 Tauri 启动代码。
 
@@ -29,9 +29,11 @@ EVE Alert（`eve-alert`）是面向 EVE Online 的屏幕 RGB 识别与告警桌�
 
 - 区域两端坐标均包含；任意像素的 RGB 精确匹配任意目标颜色即命中，忽略 alpha。不要默默引入容差或改变坐标语义。
 - 各角色独立维护状态。告警首次命中产生 `Warn`，持续命中不重复；由命中转为未命中时产生 `WarnCleared`，启动时未命中不发送解除。
+- 角色 `enabled` 缺省为 `true`，禁用状态持久保存。停止监控后调整启用状态；启动时至少启用一个角色，仅启用角色参与来源恢复、画面检查、识别与 SSE 初始角色列表，释放其他角色的预览捕获并保留凭据。覆盖已有角色配置只替换四个区域及其 RGB，保留目标角色名称、授权和启用状态，复制后区域数据独立。
 - 捕获异常和区域越界不视为告警解除。越界时暂停该角色识别并重置提醒状态。
-- 提醒按“准备区域命中 → 敌人区域命中 → 敌人区域不再命中”产生一次 `Reminder` 后重置。
+- 提醒的区域 1 / RGB1（`reminder_now_region`）、新增前置区域 2 / RGB2（`reminder_gate_region`）和原区域改为的区域 3 / RGB3（`reminder_enemy_region`）分别配置坐标与颜色。区域 1 首次命中时发送 `Reminder`（`stage: LastWave`、`message: 异常进入最后一波次`），随后检测区域 2，命中任意 RGB2 后才开启区域 3 检测，RGB2 后续消失不撤销前置记录。同帧满足前置条件后立即检测下一阶段。本轮开始前的 RGB2、前置命中前的 RGB3 不保留记录。RGB1 消失，或记录到 RGB3 后所有 RGB3 消失，发送一次 `Reminder`（`stage: Ended`、`message: 异常结束`），清空本轮标记。结束后如果 RGB1 仍在，等待它消失并重新出现才开始下一轮。两个条件同时满足只发送一次结束提醒，停止监控和无效帧重置不发送结束提醒。旧配置缺少 `reminder_gate_region` 时复制 `reminder_enemy_region` 为独立初始值，保留原区域及检测行为；界面可单独配置新增区域。
 - 当前捕获帧率上限为 2 FPS。更改频率、匹配规则或状态迁移时，说明对漏检、重复告警和资源消耗的影响。
+- RGB3（原 RGB2）支持多个目标色：任意一种命中即记录，无需全部出现；记录后按整个区域和完整颜色列表判断，所有配置颜色均不存在时才由 RGB3 消失触发结束，不能只跟踪最初命中的颜色或像素。RGB1 消失仍独立触发结束。
 - 停止监控应关闭输出任务并释放捕获资源；保留恢复凭据。捕获失败、取消、重复启停等路径也需正确清理。
 - 事件类型 `Warn`、`WarnCleared`、`Reminder` 和 JSON 字段属于外部接入协议；变更时检查所有输出渠道、前端类型、测试和 README，说明兼容性影响。
 
@@ -54,7 +56,7 @@ Debug 配置为编译时项目根目录的 `reporting.json`；Release 为 `$HOME
 | `pnpm build` | TypeScript 检查与前端构建 |
 | `pnpm exec tauri build` | 构建并打包桌面应用 |
 | `pnpm lint` | 使用 Oxlint 检查前端 |
-| `pnpm test` | 使用 Node 内置测试框架检查截图选区坐标与边界 |
+| `pnpm test` | 使用 Node 内置测试框架检查截图选区坐标、边界与角色配置覆盖 |
 | `cargo check --manifest-path src-tauri/Cargo.toml` | 检查 Rust 编译 |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | 运行 Rust 测试，可追加模块过滤条件 |
 | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 检查 Rust 格式 |
@@ -66,7 +68,7 @@ Vite 输出目录为项目根目录 `dist/`，Tauri 的 `frontendDist` 为 `../d
 
 遵循 `.editorconfig`：UTF-8、两空格缩进；Rust 格式遵循 `src-tauri/.rustfmt.toml`。Rust 模块与函数使用 `snake_case`，类型与 trait 使用 `PascalCase`；React 组件使用 `PascalCase`，变量与函数使用 `camelCase`。前端由 Oxlint 检查，TypeScript 已启用未使用变量检查。
 
-现有 Rust 测试分布在 `reporting/`、`platform/screencast/` 和 `plugin/` 等模块，前端选区纯逻辑测试位于 `tests/`，使用开发环境提供的 Node 内置测试框架；无组件测试框架或覆盖率门槛。测试聚焦关键业务行为、边界条件、错误处理和缺陷回归，禁止添加过多无用测试；避免重复覆盖、照搬实现，或仅验证简单赋值与字段读写。不为凑数量或覆盖率增加测试。
+现有 Rust 测试分布在 `reporting/`、`platform/screencast/` 和 `plugin/` 等模块，前端选区和角色配置纯逻辑测试位于 `tests/`，使用开发环境提供的 Node 内置测试框架；无组件测试框架或覆盖率门槛。测试聚焦关键业务行为、边界条件、错误处理和缺陷回归，禁止添加过多无用测试；避免重复覆盖、照搬实现，或仅验证简单赋值与字段读写。不为凑数量或覆盖率增加测试。
 
 新增后端测试沿用 Rust 内置测试框架与现有模块组织；集成测试可放入 `src-tauri/tests/`。名称描述行为，例如 `returns_none_for_unknown_service`。按改动风险选择检查；纯文档修改无需运行完整构建或桌面捕获。
 

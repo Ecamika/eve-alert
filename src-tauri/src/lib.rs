@@ -19,10 +19,18 @@ pub fn run() {
       reporting::reporting_audio,
     ])
     .setup(|app| {
-      if cfg!(debug_assertions) {
+      if cfg!(debug_assertions)
+        || std::env::var_os("EVE_ALERT_CAPTURE_DIAGNOSTICS").is_some_and(|value| value == "1")
+      {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
             .level(log::LevelFilter::Info)
+            .filter(|metadata| {
+              cfg!(debug_assertions)
+                || metadata
+                  .target()
+                  .starts_with("app_lib::platform::screencast::pipewire")
+            })
             .build(),
         )?;
       }

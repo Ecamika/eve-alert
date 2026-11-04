@@ -255,7 +255,7 @@ async fn onebot(options: OnebotOptions, sender: broadcast::Sender<ReportEvent>, 
             Ok(event) => {
               let message = serde_json::json!({
                 "action": "send_private_msg",
-                "params": { "user_id": options.target, "message": [{ "type": "text", "data": { "text": format!("{} {}", event.kind(), event.title()) } }] },
+                "params": { "user_id": options.target, "message": [{ "type": "text", "data": { "text": event.onebot_text() } }] },
                 "echo": "eve-alert"
               });
               socket.send(Message::Text(message.to_string().into())).await?;
@@ -304,11 +304,7 @@ async fn publish_ntfy(
   let body = serde_json::json!({
     "topic": topic,
     "title": format!("EVE Alert · {}", event.label()),
-    "message": format!("{}：{}", event.title(), match event {
-      ReportEvent::Warn { .. } => "检测到告警颜色",
-      ReportEvent::WarnCleared { .. } => "告警颜色已消失",
-      ReportEvent::Reminder { .. } => "提醒条件已满足",
-    }),
+    "message": format!("{}：{}", event.title(), event.message()),
     "priority": if matches!(event, ReportEvent::Warn { .. }) { 4 } else { 3 },
     "tags": [if matches!(event, ReportEvent::Warn { .. }) { "warning" } else { "white_check_mark" }],
   });
@@ -341,7 +337,7 @@ async fn notify(event: &ReportEvent) -> anyhow::Result<()> {
         0u32,
         "",
         event.label(),
-        event.title(),
+        event.notification_body(),
         Vec::<String>::new(),
         hints,
         5000i32,
@@ -358,6 +354,7 @@ async fn notify(_: &ReportEvent) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::reporting::config::ReminderStage;
   use axum::response::IntoResponse;
 
   #[tokio::test]
@@ -394,12 +391,13 @@ mod tests {
       .timeout(Duration::from_secs(2))
       .build()
       .unwrap();
-    for (event, label, priority) in [
+    for (event, label, message, priority) in [
       (
         ReportEvent::Warn {
           title: "EVE - 测试".into(),
         },
         "告警",
+        "检测到告警颜色",
         4,
       ),
       (
@@ -407,13 +405,19 @@ mod tests {
           title: "EVE - 测试".into(),
         },
         "告警解除",
+        "告警颜色已消失",
         3,
       ),
       (
-        ReportEvent::Reminder {
-          title: "EVE - 测试".into(),
-        },
+        ReportEvent::reminder("EVE - 测试".into(), ReminderStage::LastWave),
         "提醒",
+        "异常进入最后一波次",
+        3,
+      ),
+      (
+        ReportEvent::reminder("EVE - 测试".into(), ReminderStage::Ended),
+        "提醒",
+        "异常结束",
         3,
       ),
     ] {
@@ -424,7 +428,7 @@ mod tests {
       assert_eq!(headers["authorization"], "Bearer tk_local");
       assert_eq!(body["topic"], "eve_test");
       assert_eq!(body["title"], format!("EVE Alert · {label}"));
-      assert!(body["message"].as_str().unwrap().contains("EVE - 测试"));
+      assert_eq!(body["message"], format!("EVE - 测试：{message}"));
       assert_eq!(body["priority"], priority);
     }
     let error = publish_ntfy(
@@ -464,17 +468,22 @@ mod tests {
     let _ = sender.send(ReportEvent::Warn {
       title: "stale".into(),
     });
-    let _ = sender.send(ReportEvent::Reminder {
-      title: "EVE - test".into(),
-    });
+    let _ = sender.send(ReportEvent::reminder(
+      "EVE - test".into(),
+      ReminderStage::LastWave,
+    ));
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
       .await
       .unwrap()
       .unwrap()
       .unwrap();
+    let data = std::str::from_utf8(&next).unwrap();
     assert_eq!(
-      std::str::from_utf8(&next).unwrap(),
-      "data: {\"type\":\"Reminder\",\"title\":\"EVE - test\"}\n\n"
+      serde_json::from_str::<serde_json::Value>(data.strip_prefix("data: ").unwrap().trim())
+        .unwrap(),
+      serde_json::json!({
+        "type": "Reminder", "title": "EVE - test", "stage": "LastWave", "message": "异常进入最后一波次"
+      })
     );
     shutdown.send(true).unwrap();
     assert!(

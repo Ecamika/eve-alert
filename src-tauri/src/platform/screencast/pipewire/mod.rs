@@ -4,6 +4,7 @@
 //! 使用和销毁；后端不依赖 Tauri。宿主可注入 Portal 窗口标识。
 
 mod buffer;
+mod diagnostics;
 mod portal;
 mod rgba;
 mod runtime;

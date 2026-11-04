@@ -7,7 +7,7 @@ mod tests;
 
 use crate::platform::screencast::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use config::{Config, ReminderState, ReportMethod, WarningState};
+use config::{Config, ReminderStage, ReminderState, ReportMethod, WarningState};
 use futures_util::StreamExt;
 use image::ImageFormat;
 use serde::Serialize;
@@ -25,11 +25,27 @@ use tokio::{
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ReportEvent {
-  Warn { title: String },
-  WarnCleared { title: String },
-  Reminder { title: String },
+  Warn {
+    title: String,
+  },
+  WarnCleared {
+    title: String,
+  },
+  Reminder {
+    title: String,
+    stage: ReminderStage,
+    message: &'static str,
+  },
 }
 impl ReportEvent {
+  fn reminder(title: String, stage: ReminderStage) -> Self {
+    Self::Reminder {
+      title,
+      stage,
+      message: stage.message(),
+    }
+  }
+
   fn kind(&self) -> &str {
     match self {
       Self::Warn { .. } => "Warn",
@@ -39,7 +55,7 @@ impl ReportEvent {
   }
   fn title(&self) -> &str {
     match self {
-      Self::Warn { title } | Self::WarnCleared { title } | Self::Reminder { title } => title,
+      Self::Warn { title } | Self::WarnCleared { title } | Self::Reminder { title, .. } => title,
     }
   }
   fn label(&self) -> &str {
@@ -48,6 +64,25 @@ impl ReportEvent {
       Self::WarnCleared { .. } => "告警解除",
       Self::Reminder { .. } => "提醒",
     }
+  }
+
+  fn message(&self) -> &str {
+    match self {
+      Self::Warn { .. } => "检测到告警颜色",
+      Self::WarnCleared { .. } => "告警颜色已消失",
+      Self::Reminder { message, .. } => message,
+    }
+  }
+
+  fn notification_body(&self) -> String {
+    match self {
+      Self::Reminder { .. } => format!("{}：{}", self.title(), self.message()),
+      _ => self.title().to_string(),
+    }
+  }
+
+  fn onebot_text(&self) -> String {
+    format!("{} {}", self.kind(), self.notification_body())
   }
 }
 
@@ -247,10 +282,8 @@ async fn select_capture(
               }
             });
           }
-          if reminder.advance(&character, &frame.image) {
-            events.push(ReportEvent::Reminder {
-              title: worker_title.clone(),
-            });
+          if let Some(stage) = reminder.advance(&character, &frame.image) {
+            events.push(ReportEvent::reminder(worker_title.clone(), stage));
           }
           for event in events {
             let _ = sender.send(event.clone());
@@ -351,8 +384,28 @@ pub async fn reporting_start(
   if state.active.read().unwrap().is_some() {
     return Err("监控已启动".into());
   }
-  if config.characters.is_empty() {
-    return Err("请至少配置一个角色".into());
+  let config = config.into_monitoring()?;
+  // 配置时可预览任意角色，监控启动后只保留已启用角色的捕获。
+  let excluded = {
+    let mut workers = state.workers.lock().await;
+    let titles: Vec<_> = workers
+      .keys()
+      .filter(|title| !config.characters.iter().any(|c| c.title == title.as_str()))
+      .cloned()
+      .collect();
+    titles
+      .into_iter()
+      .filter_map(|title| workers.remove(&title))
+      .collect::<Vec<_>>()
+  };
+  let mut errors = Vec::new();
+  for worker in excluded {
+    if let Err(e) = worker.stop().await {
+      errors.push(e);
+    }
+  }
+  if !errors.is_empty() {
+    return Err(errors.join("；"));
   }
   for character in &config.characters {
     let connected = state
